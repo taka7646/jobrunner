@@ -1,0 +1,6 @@
+eclipse.preferences.version=1
+phpunit_config_file=/jobrunner/tests/phpunit.xml
+preload_script=/jobrunner/tests/bootstrap.php
+test_file_pattern=Test\\.php
+test_folders=/jobrunner/tests/Taka7646
+testing_framework=PHPUnit
