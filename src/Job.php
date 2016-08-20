@@ -15,6 +15,26 @@ class Job
     protected $lockFp;
 
     /**
+     * ジョブ情報
+     * [
+     * 'config' => [
+     * ]
+     * 'jobs' = [
+     * <JobId> => [
+     * 'cmd' => 実行コマンド,
+     * 'log' => ログファイルパス,
+     * 'startAt' => 'Y-m-d H:i:s',
+     * 'pid' => プロセスID
+     * 'retCode' => プロセスの終了コード　jobが終了する前はプロパティが存在しない
+     * ],
+     * ]
+     * ]
+     * 
+     * @var array
+     */
+    protected $jobInfo;
+
+    /**
      * 設定の初期値
      * work_dir 作業ディレクトリパス　このディレクトリ以下にジョブ情報ファイル、ログファイルが出力されます
      * group ジョブグループ グループ単位で並列制御されます。
@@ -29,6 +49,12 @@ class Job
     ];
 
     const LOCK_RETRY_COUNT = 5;
+
+    const STATE_NOT_FOUND = 'not found';
+
+    const STATE_COMPLETE = 'complete';
+
+    const STATE_RUNNING = 'running';
 
     private function getPath($path)
     {
@@ -72,9 +98,11 @@ class Job
     {
         $infoFile = $this->getPath($this->config['group'] . ".json");
         if (! is_file($infoFile)) {
-            return [];
+            return [
+                'jobs' => []
+            ];
         }
-        $fp = fopen($infoFile, "r+");
+        $fp = fopen($infoFile, "rb");
         if (flock($fp, LOCK_EX)) {
             $len = filesize($infoFile);
             if ($len) {
@@ -83,7 +111,9 @@ class Job
             } else {
                 $info = [];
             }
+            flock($fp, LOCK_UN);
             fclose($fp);
+            $this->jobInfo = $info;
             return $info;
         } else {
             fclose($fp);
@@ -93,23 +123,27 @@ class Job
 
     /**
      * 実行中のジョブの数を求める.
-     * @param array $jobInfo
+     * 
+     * @param array $jobInfo            
      */
-    private function getRunningCount(array $jobInfo)
+    private function getRunningCount()
     {
         $count = 0;
-        foreach($jobInfo['jobs'] as $jobId=>$job){
-            if(!isset($job['retCode'])){
-                $count++;
+        foreach ($this->jobInfo['jobs'] as $jobId => $job) {
+            if (! isset($job['retCode'])) {
+                $count ++;
             }
         }
         return $count;
     }
-    
+
     /**
      * 古いジョブ情報を削除する
-     * @param array $jobs ジョブリスト
-     * @param integer $cleanUpSecond 削除するまでの時間
+     * 
+     * @param array $jobs
+     *            ジョブリスト
+     * @param integer $cleanUpSecond
+     *            削除するまでの時間
      * @return array クリーンアップ後のジョブリスト
      */
     private function cleanUp(array $jobs, $cleanUpSecond)
@@ -130,8 +164,11 @@ class Job
 
     /**
      * ジョブ情報を更新する
-     * @param string $jobId ジョブID
-     * @param array $jobData 更新するジョブ情報
+     * 
+     * @param string $jobId
+     *            ジョブID
+     * @param array $jobData
+     *            更新するジョブ情報
      * @throws \RuntimeException
      */
     private function updateJobInfo($jobId, array $jobData)
@@ -156,7 +193,9 @@ class Job
             $data = json_encode($info);
             ftruncate($fp, 0);
             fwrite($fp, $data);
+            flock($fp, LOCK_UN);
             fclose($fp);
+            clearstatcache();
             return $info;
         } else {
             fclose($fp);
@@ -205,6 +244,7 @@ EOL;
     {
         $this->config = $config + self::DEFAULT_CONFIG;
         $this->jobId = uniqid();
+        $this->jobInfo = [];
     }
 
     public function __destruct()
@@ -216,7 +256,7 @@ EOL;
      * ジョブを実行します.
      * 実際のジョブ実行は、runner.phpが行います。
      * このメソッドではジョブのパラメータを保存して、runner.phpをバックグラウンド実行します。
-     * 
+     *
      * @param string $cmd
      *            コマンド名
      * @param array $params
@@ -232,7 +272,7 @@ EOL;
         $cmdLine = $cmd . ' ' . implode(' ', $params);
         $info = $this->loadJobInfo();
         if ($this->config['parallel'] > 0) {
-            $count = $this->getRunningCount($info);
+            $count = $this->getRunningCount();
             if ($count >= $this->config['parallel']) {
                 throw new \RuntimeException('Parallel Job is over limit!! running:' . $count);
             }
@@ -254,5 +294,68 @@ EOL;
         ]);
         $this->unlock();
         return $this->jobId;
+    }
+
+    /**
+     * 指定Jobの状態を取得します
+     * 
+     * @param string $jobId            
+     * @return array ジョブ状態情報
+     *         [
+     *         'state' => 状態文字列 STATE_NOT_FOUND, STATE_NOT_COMPLETE, STATE_RUNNING
+     *         'code' => プロセスの終了コード
+     *         ]
+     */
+    public function getJobStatus($jobId)
+    {
+        $info = $this->loadJobInfo();
+        $jobs = $info['jobs'];
+        if (! isset($jobs[$jobId])) {
+            // 指定のJOBが存在しない。
+            // jobIdが間違っているか、すでにcleanUpされています。
+            return [
+                'state' => self::STATE_NOT_FOUND,
+                'code' => 0
+            ];
+        }
+        $job = $jobs[$jobId];
+        if (isset($job['retCode'])) {
+            return [
+                'state' => self::STATE_COMPLETE,
+                'code' => $job['retCode']
+            ];
+        }
+        return [
+            'state' => self::STATE_RUNNING,
+            'code' => 0
+        ];
+    }
+
+    /**
+     * 指定JOBのログを取得する.
+     *
+     * @param string $jobId
+     *            ジョブID
+     * @param number $offset
+     *            ログファイルのオフセット
+     * @return string ログ
+     */
+    public function getJobLog($jobId, $offset = 0)
+    {
+        $info = $this->loadJobInfo();
+        $jobs = $info['jobs'];
+        if (! isset($jobs[$jobId])) {
+            return "";
+        }
+        $job = $jobs[$jobId];
+        if (! file_exists($job['log'])) {
+            return "";
+        }
+        $fp = fopen($job['log'], "rb");
+        $len = filesize($job['log']);
+        fseek($fp, $offset);
+        $data = fread($fp, $len);
+        fclose($fp);
+        return $data;
     }
 }
